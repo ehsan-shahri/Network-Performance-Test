@@ -1,89 +1,143 @@
-import socket
-import time
-import csv
-import sys
+""" 
+Author: Ehsan Shahri
+Email: ehsan.shahri@ua.pt
+Date: 2024-11-05
+Version: 2.0
+Description: This script evaluates the performance of Wi-Fi 7 networks in case of packet loss and latency. This code runs on a client to send the maximum number of UDP packets to a server to measure the metrics. 
+"""
 
-# Ensure correct number of arguments
-if len(sys.argv) != 5:
-    print("Usage: python server_script.py <PC_WiFi_IP> <PC_Ethernet_IP> <OP5_Ethernet_IP> <PORT>")
+
+
+import time
+import socket
+import sys
+import threading
+import csv
+import os
+
+# Output CSV files
+OUTPUT_CSV_FILE = os.path.expanduser("path to loss csv file/client_loss.csv")
+LATENCY_CSV_FILE = os.path.expanduser("path to latency csv file/client_latency.csv")
+
+if len(sys.argv) != 7:
+    print("Usage: <PC_WiFi_IP> <OP5_WiFi_IP> <PC_Ethernet_IP> <OP5_Ethernet_IP> <packet_length> <port>")
     sys.exit(1)
 
-# Extract network interface IPs from command line arguments
-PC_WIFI_IP = sys.argv[1]   # PC's Wi-Fi IP (Receives from OP5)
-PC_ETH_IP = sys.argv[2]    # PC's Ethernet IP (Sends back to OP5)
-OP5_ETH_IP = sys.argv[3]   # OP5's Ethernet IP (Target for returning packets)
-PORT = int(sys.argv[4])    # UDP Port
+# Extracting parameters
+PC_WIFI_IP = sys.argv[1]       # PC Wi-Fi IP (Server)
+OP5_WIFI_IP = sys.argv[2]      # OP5 Wi-Fi IP (Client)
+PC_ETH_IP = sys.argv[3]        # PC Ethernet IP (Server)
+OP5_ETH_IP = sys.argv[4]       # OP5 Ethernet IP (Client)
+PACKET_LENGTH = int(sys.argv[5])  # Packet Size
+PORT = int(sys.argv[6])        # UDP Port
 
-# CSV file to store received packet details
-CSV_FILE = r"\home\ehsan\Desktop\scenario_01\Perf_uplink_1ms_1.csv"
+r = True  # Control receiver thread
+
+# Tracking variables
+received_ids = set()  # Tracks received packets
+latency_data = []  # Stores Packet ID and Latency values
+total_sent = 0  # Count packets sent
+
+def receiver(s):
+    """ Function to receive packets on Ethernet (PC → OP5) and calculate latency. """
+    global r, latency_data
+    while r:
+        try:
+            data, address = s.recvfrom(4096)  # Receive packet
+            t_recv = int(time.time() * 1000000)  # Capture time in microseconds
+
+            # Ensure the packet comes from the correct Ethernet IP (PC → OP5)
+            if address[0] != PC_ETH_IP:
+                continue  # Ignore packets from other sources
+
+            # Extract Packet ID and original send timestamp
+            packet_id = int.from_bytes(data[-12:-8], byteorder='big')
+            t_send = int.from_bytes(data[-8:], byteorder='big')
+
+            # Compute latency (Wi-Fi → PC → Back via Ethernet)
+            latency = (t_recv - t_send) / 1000.0  # Convert microseconds to milliseconds
+            latency_data.append([packet_id, latency])  # Store latency
+
+            received_ids.add(packet_id)  # Mark packet as received
+
+            print(f"Packet ID: {packet_id}, Latency: {latency:.3f} ms")
+        except Exception as e:
+            print("Error:", e)
 
 def main():
-    """ Server listens on Wi-Fi (PC) and sends packets back via Ethernet. """
-    duration_minutes = float(input("Enter the duration of the test in minutes: "))
-    duration_seconds = duration_minutes * 60  # Convert minutes to seconds
-    print(f"Test will run for {duration_minutes} minutes ({duration_seconds} seconds)...")
+    """ Main function to send packets via Wi-Fi and receive them via Ethernet. """
+    global r, total_sent
 
-    # Create sockets
-    wifi_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)   # For receiving packets
-    eth_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)    # For sending packets
+    timesleep = 0.001  # Time between sending packets (adjustable)
+    padding_length = PACKET_LENGTH - 12
+    padd = b"\x00" * padding_length
 
-    # Bind Wi-Fi socket to receive packets from OP5
-    wifi_socket.bind((PC_WIFI_IP, PORT))
-    #  wifi_socket.bind(("0.0.0.0", PORT))  # Listen on all interfaces
-    print(f"Server listening on Wi-Fi: {PC_WIFI_IP}:{PORT}")
+    # Wi-Fi socket (OP5 → PC)
+    wifi_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    wifi_socket.bind((OP5_WIFI_IP, PORT))  # Bind to OP5 Wi-Fi IP
+    wifi_socket.settimeout(timesleep + 2)
 
-    # Open CSV file to log received packets
-    with open(CSV_FILE, mode="w", newline="") as csvfile:
+    # Ethernet socket (PC → OP5)
+    eth_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    print(f"OP5 listening for packets on Ethernet: {OP5_ETH_IP}:{PORT}")
+    eth_socket.bind((OP5_ETH_IP, PORT))  # Bind to OP5 Ethernet IP
+    eth_socket.settimeout(timesleep + 2)
+
+    # Start the receiver thread on OP5's Ethernet interface
+    x = threading.Thread(target=receiver, args=(eth_socket,))
+    x.start()
+
+    i = 0  # Packet counter
+    start = time.time()
+    end = start + 60  # Test duration (60 seconds)
+
+    while time.time() < end:
+        timestamp_ms = int(time.time() * 1000000)  # Current time in microseconds
+        data = timestamp_ms.to_bytes(8, byteorder='big')  # Convert timestamp
+        d = i.to_bytes(4, byteorder='big')  # Packet ID as bytes
+        data = padd + d + data  # Construct packet
+
+        # Send packet from OP5 (Wi-Fi) to PC
+        wifi_socket.sendto(data, (PC_WIFI_IP, PORT))
+
+        time.sleep(timesleep)  # Wait before next transmission
+
+        i += 1  # Increment counter
+
+    r = False  # Stop receiver thread
+    x.join()
+
+    total_sent = i  # Store total number of packets sent
+    total_received = len(received_ids)  # Count packets successfully received
+
+    # Print total packets sent
+    print(f"\nTotal Packets Sent from OP5: {total_sent}")
+
+    # Calculate packet loss
+    packet_loss = ((total_sent - total_received) / total_sent) * 100 if total_sent > 0 else 0.0
+
+    # Save packet loss results
+    with open(OUTPUT_CSV_FILE, mode="w", newline="") as csvfile:
         csv_writer = csv.writer(csvfile)
-        csv_writer.writerow(["Packet ID", "Packet Length (bytes)", "Reception Time (seconds)"])  # CSV header
+        csv_writer.writerow(["Total Packets Sent", "Total Packets Received", "Packet Loss (%)"])
+        csv_writer.writerow([total_sent, total_received, f"{packet_loss:.2f}%"])
 
-        start_time = time.time()
-        packet_count = 0
-        total_received_bytes = 0
+    # Save latency results
+    with open(LATENCY_CSV_FILE, mode="w", newline="") as latency_csv:
+        latency_writer = csv.writer(latency_csv)
+        latency_writer.writerow(["Packet ID", "Latency (ms)"])
+        latency_writer.writerows(latency_data)
 
-        try:
-            while True:
-                elapsed_time = time.time() - start_time
-                if elapsed_time > duration_seconds:
-                    print("Test duration completed.")
-                    break
+    # Print final results
+    print("\nPacket Loss Summary")
+    print("===================")
+    print(f"Total Packets Sent: {total_sent}")
+    print(f"Total Packets Received: {total_received}")
+    print(f"Packet Loss Percentage: {packet_loss:.2f}%")
 
-                # Receive packet from OP5 over Wi-Fi
-                data, addr = wifi_socket.recvfrom(4096)
-
-                packet_length = len(data)
-                reception_time = time.time() - start_time  # Relative time since start
-
-                # Extract Packet ID and original send timestamp
-                if len(data) >= 12:
-                    packet_id = int.from_bytes(data[-12:-8], byteorder='big')  # Extract Packet ID
-                    t_send = int.from_bytes(data[-8:], byteorder='big')  # Extract send timestamp
-                else:
-                    packet_id = packet_count + 1  # Fallback Packet ID
-                    t_send = 0  # Fallback timestamp
-
-                # Log reception
-                packet_count += 1
-                total_received_bytes += packet_length
-                print(f"Packet #{packet_id} received: {packet_length} bytes at {reception_time:.3f} seconds")
-                
-
-                # Write to CSV
-                csv_writer.writerow([packet_id, packet_length, round(reception_time, 3)])
-
-                # Send the same packet back to OP5 via Ethernet
-                #  eth_socket.sendto(data, (OP5_ETH_IP, PORT))
-                print(f"Sending packet back to OP5 via Ethernet: {OP5_ETH_IP}:{PORT}")
-                eth_socket.sendto(data, (OP5_ETH_IP, PORT))
-
-
-        except KeyboardInterrupt:
-            print("\nTest interrupted by user.")
-
-        finally:
-            wifi_socket.close()
-            eth_socket.close()
-            print(f"Server stopped. Total packets received: {packet_count}, Total bytes received: {total_received_bytes}")
+    # Close sockets
+    wifi_socket.close()
+    eth_socket.close()
 
 if __name__ == "__main__":
     main()
